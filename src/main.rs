@@ -24,7 +24,10 @@ pub struct Cli {
     pub command: Commands,
 }
 
-struct ClientHandler;
+struct ClientHandler {
+    server_addr: String,
+    known_hosts_path: PathBuf,
+}
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -73,6 +76,18 @@ pub enum Commands {
         #[arg(required = true)]
         ref_name: String,
     },
+    Fetch {
+        #[arg(required = true)]
+        remote: String,
+        #[arg(required = true)]
+        ref_name: String,
+    },
+    Pull {
+        #[arg(required = true)]
+        remote: String,
+        #[arg(required = true)]
+        ref_name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +127,47 @@ pub enum FileMode {
     Regular,
     Executable,
     Directory,
+    Symlink,
+}
+
+impl FileMode {
+    /// Git-style octal mode string used in Tree/Index serialization.
+    pub fn to_octal_str(self) -> &'static str {
+        match self {
+            FileMode::Regular => "100644",
+            FileMode::Executable => "100755",
+            FileMode::Directory => "040000",
+            FileMode::Symlink => "120000",
+        }
+    }
+
+    pub fn from_octal_str(s: &str) -> Self {
+        match s {
+            "100755" => FileMode::Executable,
+            "040000" | "40000" => FileMode::Directory,
+            "120000" => FileMode::Symlink,
+            _ => FileMode::Regular,
+        }
+    }
+
+    /// Numeric tag used only by the binary Index format (compact, fixed-width).
+    pub fn to_tag(self) -> u8 {
+        match self {
+            FileMode::Regular => 0,
+            FileMode::Executable => 1,
+            FileMode::Directory => 2,
+            FileMode::Symlink => 3,
+        }
+    }
+
+    pub fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => FileMode::Executable,
+            2 => FileMode::Directory,
+            3 => FileMode::Symlink,
+            _ => FileMode::Regular,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +301,13 @@ impl RefKind {
             RefKind::Tag(name) => PathBuf::from("refs").join("tags").join(name),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullResult {
+    AlreadyUpToDate,
+    FastForwarded(String),
+    DivergedNeedsMerge { local: String, remote: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,22 +546,33 @@ impl Repository {
         }
 
         let full_path = self.worktree.join(relative_path);
-        let data = fs::read(&full_path)?;
-        let metadata = fs::metadata(&full_path)?;
+        // symlink_metadata (w przeciwieństwie do metadata) NIE podąża za
+        // dowiązaniem, więc możemy je poprawnie rozróżnić od zwykłego pliku.
+        let link_metadata = fs::symlink_metadata(&full_path)?;
 
-        let blob_hash = self.write_object(&BrassObject::Blob(Blob { data }))?;
-        let mode = if metadata.permissions().readonly() {
-            FileMode::Regular
+        let (data, mode) = if link_metadata.file_type().is_symlink() {
+            let target = fs::read_link(&full_path)?;
+            (target.to_string_lossy().into_owned().into_bytes(), FileMode::Symlink)
         } else {
-            FileMode::Executable
+            let metadata = fs::metadata(&full_path)?;
+            let content = fs::read(&full_path)?;
+            let mode = if metadata.permissions().readonly() {
+                FileMode::Regular
+            } else {
+                FileMode::Executable
+            };
+            (content, mode)
         };
+
+        let file_size = data.len() as u64;
+        let blob_hash = self.write_object(&BrassObject::Blob(Blob { data }))?;
 
         let entry = IndexEntry {
             path: relative_path.to_path_buf(),
             hash: blob_hash,
             mode,
-            modified_at: metadata.modified()?,
-            file_size: metadata.len(),
+            modified_at: link_metadata.modified()?,
+            file_size,
         };
 
         if let Some(existing) = index.entries.iter_mut().find(|e| e.path == relative_path) {
@@ -561,7 +635,25 @@ impl Repository {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Cel checkout nie istnieje"));
         };
 
-        let target_files = self.flatten_tree_from_commit(&commit_hash)?;
+        self.materialize_commit(&commit_hash)?;
+
+        if target_ref_path.exists() {
+            let rel_suffix = target_ref_path.strip_prefix(&self.brass_dir).unwrap_or(&target_ref_path);
+            fs::write(self.brass_dir.join("HEAD"), format!("ref: {}\n", rel_suffix.display()))?;
+        } else {
+            fs::write(self.brass_dir.join("HEAD"), format!("{}\n", commit_hash))?;
+        }
+
+        Ok(())
+    }
+
+    /// Zapisuje na dysku pliki robocze odpowiadające danemu commitowi i
+    /// aktualizuje lokalny `index`. NIE dotyka HEAD ani żadnego refa - to
+    /// odpowiedzialność wywołującego (np. `checkout` przełącza HEAD, a
+    /// fast-forward `pull` przesuwa istniejącą gałąź, zanim to wywoła).
+    fn materialize_commit(&self, commit_hash: &str) -> std::io::Result<()> {
+        let target_files = self.flatten_tree_from_commit(commit_hash)?;
+        let target_modes = self.flatten_tree_modes_from_commit(commit_hash)?;
         let mut new_index = Index::default();
 
         for (rel_path, hash) in &target_files {
@@ -570,15 +662,34 @@ impl Repository {
                 if let Some(parent) = full_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&full_path, &blob.data)?;
 
-                let metadata = fs::metadata(&full_path)?;
+                let entry_mode = target_modes.get(rel_path).copied().unwrap_or(FileMode::Regular);
+
+                if entry_mode == FileMode::Symlink {
+                    if full_path.exists() || full_path.symlink_metadata().is_ok() {
+                        let _ = fs::remove_file(&full_path);
+                    }
+                    let link_target = String::from_utf8_lossy(&blob.data).into_owned();
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink(&link_target, &full_path)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Brak natywnych symlinków (np. Windows bez uprawnień) - zapisujemy dane jak zwykły plik.
+                        fs::write(&full_path, link_target.as_bytes())?;
+                    }
+                } else {
+                    fs::write(&full_path, &blob.data)?;
+                }
+
+                let disk_metadata = fs::symlink_metadata(&full_path)?;
                 new_index.entries.push(IndexEntry {
                     path: rel_path.clone(),
                                        hash: hash.clone(),
-                                       mode: FileMode::Regular,
-                                       modified_at: metadata.modified()?,
-                                       file_size: metadata.len(),
+                                       mode: entry_mode,
+                                       modified_at: disk_metadata.modified()?,
+                                       file_size: disk_metadata.len(),
                 });
             }
         }
@@ -596,14 +707,6 @@ impl Repository {
         }
 
         new_index.save(&self.brass_dir.join("index"))?;
-
-        if target_ref_path.exists() {
-            let rel_suffix = target_ref_path.strip_prefix(&self.brass_dir).unwrap_or(&target_ref_path);
-            fs::write(self.brass_dir.join("HEAD"), format!("ref: {}\n", rel_suffix.display()))?;
-        } else {
-            fs::write(self.brass_dir.join("HEAD"), format!("{}\n", commit_hash))?;
-        }
-
         Ok(())
     }
 
@@ -1133,6 +1236,106 @@ impl Repository {
         Ok((packed_count, pack_path))
     }
 
+    /// Rozpakowuje strumień paczki otrzymany od serwera (Fetch) i zapisuje
+    /// zawarte w niej obiekty jako luźne obiekty lokalne. Paczka to po
+    /// prostu konkatenacja niezależnie skompresowanych Zlibem obiektów
+    /// (dokładnie ten sam format co `pack()` zapisuje na dysku) - każdy
+    /// strumień Zlib ma własny koniec, więc możemy je dekodować kolejno
+    /// bez dodatkowego indeksu ramek.
+    pub fn unpack_objects(&self, pack_data: &[u8]) -> std::io::Result<usize> {
+        let mut cursor = 0usize;
+        let mut count = 0usize;
+
+        while cursor < pack_data.len() {
+            let remaining = &pack_data[cursor..];
+            let remaining_len = remaining.len();
+
+            let mut decoder = ZlibDecoder::new(remaining);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Uszkodzona paczka obiektów: {}", e))
+            })?;
+
+            let bytes_left_after = decoder.get_ref().len();
+            let consumed = remaining_len - bytes_left_after;
+            if consumed == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Nie udało się przetworzyć paczki (zerowy postęp)"));
+            }
+
+            let mut hasher = Sha256::new();
+            hasher.update(&decompressed);
+            let hash = format!("{:x}", hasher.finalize());
+
+            let obj_dir = self.brass_dir.join("objects").join(&hash[..2]);
+            fs::create_dir_all(&obj_dir)?;
+            let obj_path = obj_dir.join(&hash[2..]);
+            if !obj_path.exists() {
+                let file = File::create(&obj_path)?;
+                let mut encoder = ZlibEncoder::new(file, Compression::default());
+                encoder.write_all(&decompressed)?;
+            }
+
+            count += 1;
+            cursor += consumed;
+        }
+
+        Ok(count)
+    }
+
+    /// Zapisuje pobraną paczkę lokalnie i aktualizuje zdalnie-śledzącego
+    /// refa `refs/remotes/origin/<ref_name>`. Nie dotyka working tree ani
+    /// lokalnej gałęzi - to robi dopiero `pull`.
+    pub fn fetch(&self, remote_ref_hash: Option<&str>, ref_name: &str, pack_data: &[u8]) -> std::io::Result<usize> {
+        let count = self.unpack_objects(pack_data)?;
+
+        if let Some(hash) = remote_ref_hash {
+            let tracking_path = self.brass_dir.join("refs").join("remotes").join("origin").join(ref_name);
+            if let Some(parent) = tracking_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(tracking_path, format!("{}\n", hash))?;
+        }
+
+        Ok(count)
+    }
+
+    /// `pull` w tej implementacji jest CELOWO fast-forward-only (jak `git
+    /// pull --ff-only`): jeśli lokalna gałąź jest wprost przodkiem
+    /// zdalnego commita, przesuwamy wskaźnik i aktualizujemy pliki
+    /// robocze. W przeciwnym razie zwracamy `DivergedNeedsMerge` i nie
+    /// ruszamy nic na dysku - scalanie rozbieżnych historii zostaw np.
+    /// `leaf merge`, żeby uniknąć cichej utraty commitów.
+    pub fn pull_fast_forward(&self, ref_name: &str) -> std::io::Result<PullResult> {
+        let tracking_path = self.brass_dir.join("refs").join("remotes").join("origin").join(ref_name);
+        if !tracking_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Brak śledzonego refa zdalnego - wykonaj najpierw `brass fetch`",
+            ));
+        }
+
+        let remote_hash = fs::read_to_string(&tracking_path)?.trim().to_string();
+        let local_hash = self.get_head_commit_hash().unwrap_or_default();
+
+        if !local_hash.is_empty() && local_hash == remote_hash {
+            return Ok(PullResult::AlreadyUpToDate);
+        }
+
+        let is_fast_forward = if local_hash.is_empty() {
+            true
+        } else {
+            self.find_lca(&local_hash, &remote_hash)?.as_deref() == Some(local_hash.as_str())
+        };
+
+        if is_fast_forward {
+            self.update_head_target(&remote_hash)?;
+            self.materialize_commit(&remote_hash)?;
+            Ok(PullResult::FastForwarded(remote_hash))
+        } else {
+            Ok(PullResult::DivergedNeedsMerge { local: local_hash, remote: remote_hash })
+        }
+    }
+
     fn collect_all_reachable_hashes(&self) -> std::io::Result<HashSet<String>> {
         let mut reachable = HashSet::new();
         let mut root_hashes = Vec::new();
@@ -1341,6 +1544,28 @@ impl Repository {
         Ok(())
     }
 
+    fn flatten_tree_modes_from_commit(&self, commit_hash: &str) -> std::io::Result<HashMap<PathBuf, FileMode>> {
+        let mut result = HashMap::new();
+        if let Ok(BrassObject::Commit(commit)) = self.read_object(commit_hash) {
+            self.collect_tree_modes(&commit.tree_hash, Path::new(""), &mut result)?;
+        }
+        Ok(result)
+    }
+
+    fn collect_tree_modes(&self, tree_hash: &str, prefix: &Path, map: &mut HashMap<PathBuf, FileMode>) -> std::io::Result<()> {
+        if let Ok(BrassObject::Tree(tree)) = self.read_object(tree_hash) {
+            for entry in tree.entries {
+                let path = prefix.join(&entry.name);
+                if entry.mode == FileMode::Directory {
+                    self.collect_tree_modes(&entry.hash, &path, map)?;
+                } else {
+                    map.insert(path, entry.mode);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn find_lca(&self, commit_a: &str, commit_b: &str) -> std::io::Result<Option<String>> {
         let mut ancestors_a = HashSet::new();
         let mut queue = VecDeque::new();
@@ -1424,11 +1649,19 @@ impl BrassObject {
 }
 
 impl Tree {
+    /// Format (inspired przez Git): "<tryb_ósemkowy> <nazwa>\0<hash>\n"
+    /// Nazwa może zawierać spacje - jest oddzielona od trybu jednym znakiem
+    /// spacji na starcie linii, a od hasha bajtem NUL, który nigdy nie
+    /// występuje w nazwie pliku ani w hexowym haszu SHA256.
     pub fn serialize_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         for entry in &self.entries {
-            let line = format!("{:?} {}\0{}\n", entry.mode, entry.name, entry.hash);
-            buf.extend_from_slice(line.as_bytes());
+            buf.extend_from_slice(entry.mode.to_octal_str().as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(entry.name.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(entry.hash.as_bytes());
+            buf.push(b'\n');
         }
         buf
     }
@@ -1442,18 +1675,24 @@ impl Tree {
             if line.is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = line.split('\0').collect();
-            if parts.len() == 2 {
-                let header_parts: Vec<&str> = parts[0].split_whitespace().collect();
-                let mode = match header_parts.first().copied() {
-                    Some("Regular") => FileMode::Regular,
-                    Some("Executable") => FileMode::Executable,
-                    _ => FileMode::Directory,
-                };
-                let name = header_parts.get(1).unwrap_or(&"").to_string();
-                let hash = parts[1].trim().to_string();
-                entries.push(TreeEntry { mode, name, hash });
-            }
+            let null_pos = line.find('\0').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Wpis Tree bez separatora NUL")
+            })?;
+
+            let header = &line[..null_pos];
+            let hash = line[null_pos + 1..].trim().to_string();
+
+            // Tylko PIERWSZA spacja oddziela tryb od nazwy - reszta nazwy,
+            // nawet ze spacjami w środku, trafia w całości do `name`.
+            let mut header_parts = header.splitn(2, ' ');
+            let mode_str = header_parts.next().unwrap_or("");
+            let name = header_parts.next().unwrap_or("").to_string();
+
+            entries.push(TreeEntry {
+                mode: FileMode::from_octal_str(mode_str),
+                name,
+                hash,
+            });
         }
         Ok(Self { entries })
     }
@@ -1524,51 +1763,127 @@ impl Commit {
     }
 }
 
+// Binarny format pliku indeksu:
+//   [0..4)   magic "BRIX"
+//   [4..8)   wersja formatu (u32 LE)
+//   [8..12)  liczba wpisów  (u32 LE)
+//   dla każdego wpisu:
+//     [0]      tag trybu pliku (u8, patrz FileMode::to_tag)
+//     [1..65)  hash SHA256 jako 64 bajty ASCII (hex)
+//     [65..73) czas modyfikacji, sekundy od epoki (u64 LE)
+//     [73..77) czas modyfikacji, nanosekundy      (u32 LE)
+//     [77..85) rozmiar pliku w bajtach             (u64 LE)
+//     [85..89) długość ścieżki w bajtach           (u32 LE)
+//     [89..)   ścieżka jako UTF-8 (dokładnie `path_len` bajtów)
+// Format length-prefixed jest odporny na dowolne znaki w ścieżce
+// (taby, nowe linie), w przeciwieństwie do poprzedniego formatu
+// rozdzielanego tabulatorami.
+const INDEX_MAGIC: &[u8; 4] = b"BRIX";
+const INDEX_VERSION: u32 = 1;
+const INDEX_HASH_LEN: usize = 64; // hex-encoded SHA256 zawsze ma 64 znaki
+
 impl Index {
     pub fn load(path: &Path) -> std::io::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
+        let data = fs::read(path)?;
+        Self::from_bytes(&data)
+    }
 
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
-
-        for line in reader.lines() {
-            let line = line?;
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() == 3 {
-                let mode = match parts[0] {
-                    "100755" => FileMode::Executable,
-                    "040000" => FileMode::Directory,
-                    _ => FileMode::Regular,
-                };
-                let hash = parts[1].to_string();
-                let relative_path = PathBuf::from(parts[2]);
-
-                entries.push(IndexEntry {
-                    path: relative_path,
-                    hash,
-                    mode,
-                    modified_at: SystemTime::now(),
-                             file_size: 0,
-                });
-            }
+    fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
+        fn corrupt(msg: impl Into<String>) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
         }
+
+        if data.len() < 12 {
+            return Err(corrupt("Plik indeksu jest za krótki (brak nagłówka)"));
+        }
+        if &data[0..4] != INDEX_MAGIC {
+            return Err(corrupt("Nieprawidłowy magic number pliku indeksu"));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != INDEX_VERSION {
+            return Err(corrupt(format!("Nieobsługiwana wersja indeksu: {} (oczekiwano {})", version, INDEX_VERSION)));
+        }
+        let entry_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+        let mut offset = 12usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        const FIXED_ENTRY_LEN: usize = 1 + INDEX_HASH_LEN + 8 + 4 + 8 + 4;
+
+        for _ in 0..entry_count {
+            if offset + FIXED_ENTRY_LEN > data.len() {
+                return Err(corrupt("Uszkodzony plik indeksu (nieoczekiwany koniec danych w nagłówku wpisu)"));
+            }
+
+            let mode_tag = data[offset];
+            offset += 1;
+
+            let hash = String::from_utf8(data[offset..offset + INDEX_HASH_LEN].to_vec())
+                .map_err(|_| corrupt("Hash w indeksie nie jest poprawnym UTF-8"))?;
+            offset += INDEX_HASH_LEN;
+
+            let secs = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let nanos = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+
+            let file_size = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+
+            let path_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            if offset + path_len > data.len() {
+                return Err(corrupt("Uszkodzony plik indeksu (ścieżka wykracza poza dane pliku)"));
+            }
+            let path_str = String::from_utf8(data[offset..offset + path_len].to_vec())
+                .map_err(|_| corrupt("Ścieżka w indeksie nie jest poprawnym UTF-8"))?;
+            offset += path_len;
+
+            entries.push(IndexEntry {
+                path: PathBuf::from(path_str),
+                hash,
+                mode: FileMode::from_tag(mode_tag),
+                modified_at: SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos),
+                file_size,
+            });
+        }
+
         Ok(Self { entries })
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let mut file = File::create(path)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(INDEX_MAGIC);
+        buf.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+
         for entry in &self.entries {
-            let mode_str = match entry.mode {
-                FileMode::Executable => "100755",
-                FileMode::Directory => "040000",
-                FileMode::Regular => "100644",
-            };
-            writeln!(file, "{}\t{}\t{}", mode_str, entry.hash, entry.path.to_string_lossy())?;
+            buf.push(entry.mode.to_tag());
+
+            // Hash zawsze zapisujemy jako dokładnie INDEX_HASH_LEN bajtów,
+            // dopełniając/przycinając na wypadek nietypowej długości hasha.
+            let mut hash_bytes = entry.hash.clone().into_bytes();
+            hash_bytes.resize(INDEX_HASH_LEN, b'0');
+            buf.extend_from_slice(&hash_bytes);
+
+            let dur = entry
+            .modified_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+            buf.extend_from_slice(&dur.as_secs().to_le_bytes());
+            buf.extend_from_slice(&dur.subsec_nanos().to_le_bytes());
+
+            buf.extend_from_slice(&entry.file_size.to_le_bytes());
+
+            let path_bytes = entry.path.to_string_lossy().into_owned().into_bytes();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&path_bytes);
         }
-        Ok(())
+
+        fs::write(path, buf)
     }
 }
 
@@ -1584,28 +1899,117 @@ impl BrassConfig {
     }
 }
 
+/// Wczytuje mapę "adres_serwera -> odcisk klucza" z pliku known_hosts.
+/// Format: jedna linia na host, `<adres> <fingerprint>`.
+fn load_known_hosts(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            if let Some((addr, fp)) = line.split_once(' ') {
+                map.insert(addr.trim().to_string(), fp.trim().to_string());
+            }
+        }
+    }
+    map
+}
+
+fn append_known_host(path: &Path, addr: &str, fingerprint: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{} {}", addr, fingerprint)?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
+    /// Trust-on-first-use, jak w zwykłym kliencie OpenSSH: pierwszy klucz
+    /// danego hosta jest zapisywany i akceptowany; każda KOLEJNA zmiana
+    /// klucza dla tego samego adresu jest odrzucana (możliwy MITM) zamiast
+    /// bezwarunkowo akceptowana jak wcześniej.
     async fn check_server_key(
         &mut self,
-        _server_public_key: &key::PublicKey,
+        server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true) // Akceptujemy klucz serwera w środowisku lokalnym
+        let fingerprint = server_public_key.fingerprint();
+        let known_hosts = load_known_hosts(&self.known_hosts_path);
+
+        match known_hosts.get(&self.server_addr) {
+            Some(expected) if expected == &fingerprint => Ok(true),
+            Some(expected) => {
+                eprintln!(
+                    "!!! OSTRZEŻENIE BEZPIECZEŃSTWA !!!\nKlucz serwera '{}' ZMIENIŁ SIĘ od ostatniego połączenia.\n  Zapisany w known_hosts:  {}\n  Otrzymany teraz:         {}\nMożliwy atak man-in-the-middle - połączenie odrzucone.",
+                    self.server_addr, expected, fingerprint
+                );
+                Ok(false)
+            }
+            None => {
+                eprintln!(
+                    "Nieznany host '{}'. Odcisk klucza (SHA256): {}\nZapisuję w {:?} (trust-on-first-use) i kontynuuję.",
+                    self.server_addr, fingerprint, self.known_hosts_path
+                );
+                if let Err(e) = append_known_host(&self.known_hosts_path, &self.server_addr, &fingerprint) {
+                    eprintln!("Nie udało się zapisać known_hosts: {}", e);
+                }
+                Ok(true)
+            }
+        }
     }
+}
+
+/// Ładuje prywatny klucz SSH użytkownika z ~/.ssh (id_ed25519 lub id_rsa).
+/// Wcześniej push logował się hasłem pustym ("") - to nie jest
+/// autentykacja, tylko jej pozorowanie. Teraz wymagany jest realny klucz.
+fn load_client_key_pair() -> Result<russh_keys::key::KeyPair, Box<dyn std::error::Error>> {
+    let home = std::env::var("HOME").map_err(|_| "Nie można ustalić katalogu domowego (brak zmiennej HOME)")?;
+    let ssh_dir = PathBuf::from(home).join(".ssh");
+    let candidates = [ssh_dir.join("id_ed25519"), ssh_dir.join("id_rsa")];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return russh_keys::load_secret_key(candidate, None)
+            .map_err(|e| format!("Nie udało się wczytać klucza {:?}: {}", candidate, e).into());
+        }
+    }
+
+    Err(format!(
+        "Nie znaleziono klucza prywatnego SSH ({:?} ani {:?}). Wygeneruj go poleceniem `ssh-keygen -t ed25519`.",
+        candidates[0], candidates[1]
+    )
+    .into())
+}
+
+async fn connect_authenticated(
+    server_addr: &str,
+    known_hosts_path: &Path,
+) -> Result<russh::client::Handle<ClientHandler>, Box<dyn std::error::Error>> {
+    let config = Arc::new(Config::default());
+    let handler = ClientHandler {
+        server_addr: server_addr.to_string(),
+        known_hosts_path: known_hosts_path.to_path_buf(),
+    };
+    let mut session = russh::client::connect(config, server_addr, handler).await?;
+
+    let key_pair = load_client_key_pair()?;
+    let user = std::env::var("USER").unwrap_or_else(|_| "brass_user".to_string());
+    let authenticated = session.authenticate_publickey(user, Arc::new(key_pair)).await?;
+    if !authenticated {
+        return Err("Serwer odrzucił autentykację kluczem SSH".into());
+    }
+
+    Ok(session)
 }
 
 pub async fn network_push_pack(
     server_addr: &str,
     pack_data: &[u8],
     remote_ref: &str,
+    known_hosts_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Arc::new(Config::default());
-    let mut session = russh::client::connect(config, server_addr, ClientHandler).await?;
-
-    // Logowanie anonimowe/kluczem
-    let _ = session.authenticate_password("brass_user", "").await?;
+    let mut session = connect_authenticated(server_addr, known_hosts_path).await?;
 
     let mut channel = session.channel_open_session().await?;
     let cmd = format!("brass-receive-pack {}", remote_ref);
@@ -1622,6 +2026,49 @@ pub async fn network_push_pack(
     }
 
     Ok(())
+}
+
+/// Pobiera paczkę obiektów z serwera dla danego refa (Fetch/Pull).
+///
+/// UWAGA - konwencja protokołu: zakładam, symetrycznie do już istniejącego
+/// `brass-receive-pack` po stronie push, że serwer wystawia komendę
+/// `brass-upload-pack <ref>`, strumieniuje paczkę obiektów na stdout, a
+/// aktualny hash wierzchołka refa wysyła jedną linią `ref-hash:<hash>` na
+/// stderr. Nie mam dostępu do kodu `brass_control_server`, więc to działa
+/// dopiero gdy serwer faktycznie implementuje tę komendę w ten sposób -
+/// dopasuj do rzeczywistego protokołu serwera, jeśli się różni.
+pub async fn network_fetch_pack(
+    server_addr: &str,
+    remote_ref: &str,
+    known_hosts_path: &Path,
+) -> Result<(Option<String>, Vec<u8>), Box<dyn std::error::Error>> {
+    let mut session = connect_authenticated(server_addr, known_hosts_path).await?;
+
+    let mut channel = session.channel_open_session().await?;
+    let cmd = format!("brass-upload-pack {}", remote_ref);
+    channel.exec(true, cmd.as_bytes()).await?;
+    channel.eof().await?;
+
+    let mut pack_data = Vec::new();
+    let mut meta_text = String::new();
+
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            russh::ChannelMsg::Data { data } => pack_data.extend_from_slice(&data),
+            russh::ChannelMsg::ExtendedData { data, .. } => {
+                meta_text.push_str(&String::from_utf8_lossy(&data));
+            }
+            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    let ref_hash = meta_text
+    .lines()
+    .find_map(|line| line.strip_prefix("ref-hash:"))
+    .map(|h| h.trim().to_string());
+
+    Ok((ref_hash, pack_data))
 }
 
 fn main() {
@@ -1781,13 +2228,14 @@ fn main() {
         }
         Commands::Push { remote, ref_name } => {
             let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            let known_hosts_path = repo.brass_dir.join("known_hosts");
             match repo.pack() {
                 Ok((_count, pack_path)) => {
                     let pack_bytes = fs::read(&pack_path).expect("Błąd odczytu spakowanego pliku");
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(async {
                         println!("Wysyłanie paczki na serwer {}...", remote);
-                        if let Err(e) = network_push_pack(&remote, &pack_bytes, &ref_name).await {
+                        if let Err(e) = network_push_pack(&remote, &pack_bytes, &ref_name, &known_hosts_path).await {
                             eprintln!("Błąd podczas pushowania: {}", e);
                         } else {
                             println!("Pomyślnie wysłano dane na serwer.");
@@ -1796,6 +2244,56 @@ fn main() {
                 }
                 Err(e) => eprintln!("Nie udało się spakować obiektów przed wysłaniem: {}", e),
             }
+        }
+        Commands::Fetch { remote, ref_name } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            let known_hosts_path = repo.brass_dir.join("known_hosts");
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            rt.block_on(async {
+                println!("Pobieranie '{}' z serwera {}...", ref_name, remote);
+                match network_fetch_pack(&remote, &ref_name, &known_hosts_path).await {
+                    Ok((ref_hash, pack_data)) => {
+                        match repo.fetch(ref_hash.as_deref(), &ref_name, &pack_data) {
+                            Ok(count) => println!(
+                                "Pobrano {} obiektów. Zaktualizowano refs/remotes/origin/{}.",
+                                count, ref_name
+                            ),
+                            Err(e) => eprintln!("Błąd zapisu pobranych obiektów: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("Błąd podczas fetchowania: {}", e),
+                }
+            });
+        }
+        Commands::Pull { remote, ref_name } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            let known_hosts_path = repo.brass_dir.join("known_hosts");
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            rt.block_on(async {
+                println!("Pobieranie '{}' z serwera {}...", ref_name, remote);
+                let fetch_result = network_fetch_pack(&remote, &ref_name, &known_hosts_path).await
+                .and_then(|(ref_hash, pack_data)| {
+                    repo.fetch(ref_hash.as_deref(), &ref_name, &pack_data)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })
+                });
+
+                match fetch_result {
+                    Ok(_) => match repo.pull_fast_forward(&ref_name) {
+                        Ok(PullResult::AlreadyUpToDate) => println!("Już aktualne."),
+                        Ok(PullResult::FastForwarded(hash)) => {
+                            println!("Przewinięto do przodu (fast-forward) do commita: {}", hash)
+                        }
+                        Ok(PullResult::DivergedNeedsMerge { local, remote }) => eprintln!(
+                            "Historie się rozjechały (lokalny: {}, zdalny: {}) - to nie jest fast-forward. Scal ręcznie (np. przez `brass leaf merge`).",
+                            local, remote
+                        ),
+                        Err(e) => eprintln!("Błąd podczas pull (fast-forward): {}", e),
+                    },
+                    Err(e) => eprintln!("Błąd podczas pull (fetch): {}", e),
+                }
+            });
         }
     }
 }
